@@ -1,0 +1,19 @@
+CREATE TABLE log_entries (
+    id UUID PRIMARY KEY,
+    raw_log TEXT,
+    source VARCHAR(255),
+    severity VARCHAR(255),
+    message VARCHAR(255),
+    error_type VARCHAR(255),
+    stack_trace TEXT,
+    context TEXT,
+    environment VARCHAR(255),
+    timestamp TIMESTAMP WITHOUT TIME ZONE,
+    created_at TIMESTAMP WITHOUT TIME ZONE,
+    status VARCHAR(50),
+    CONSTRAINT chk_status CHECK (status IN ('PENDING', 'ANALYZED', 'FAILED'))
+);
+
+CREATE INDEX idx_source ON log_entries(source);
+CREATE INDEX idx_severity ON log_entries(severity);
+CREATE INDEX idx_created_at ON log_entries(created_at);

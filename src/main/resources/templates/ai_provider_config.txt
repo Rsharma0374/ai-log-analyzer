@@ -1,0 +1,12 @@
+CREATE TABLE ai_config (
+     config_key   VARCHAR(255) PRIMARY KEY,
+     config_value TEXT,
+     model        VARCHAR(255)
+ );
+
+ -- Optional indexes (add only if you query by these columns frequently)
+ CREATE INDEX idx_ai_config_model
+     ON ai_config(model);
+
+ CREATE INDEX idx_ai_config_value
+     ON ai_config(config_value);
