@@ -19,13 +19,12 @@ public class GeminiService {
     private static final String GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
     
     private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper;
+    private ObjectMapper objectMapper;
     private final InfisicalService infisicalService;
 
     @Autowired
-    public GeminiService(RestTemplate restTemplate, ObjectMapper objectMapper, InfisicalService infisicalService) {
+    public GeminiService(RestTemplate restTemplate, InfisicalService infisicalService) {
         this.restTemplate = restTemplate;
-        this.objectMapper = objectMapper;
         this.infisicalService = infisicalService;
     }
 

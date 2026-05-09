@@ -1,53 +1,91 @@
 package in.guardianservices.ai_log_analyzer.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import in.guardianservices.ai_log_analyzer.dto.AnalysisResponse;
 import in.guardianservices.ai_log_analyzer.dto.LogAnalysisRequest;
+import in.guardianservices.ai_log_analyzer.model.AnalysisJob;
 import in.guardianservices.ai_log_analyzer.model.AnalysisResult;
 import in.guardianservices.ai_log_analyzer.model.LogEntry;
+import in.guardianservices.ai_log_analyzer.repository.AnalysisJobRepository;
 import in.guardianservices.ai_log_analyzer.repository.AnalysisResultRepository;
 import in.guardianservices.ai_log_analyzer.repository.LogEntryRepository;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class LogAnalysisService {
-
-    private final LogParser logParser;
-    private final AiAnalysisService aiAnalysisService;
+    private static final Logger log = LoggerFactory.getLogger(LogAnalysisService.class);
     private final LogEntryRepository logEntryRepository;
-    private final AnalysisResultRepository analysisResultRepository;
+    private final AnalysisJobRepository jobRepository;
+    private final LogParser logParser;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper;
     private final RedisTemplate<String, Object> redisTemplate;
+    private final AnalysisResultRepository analysisResultRepository;
+    private final AiAnalysisService aiAnalysisService;
 
     @Transactional
     public LogEntry parseAndSaveLog(LogAnalysisRequest request) {
         log.debug("Parsing log from source: {}", request.getSource());
-        LogEntry logEntry = logParser.parseLog(
+        
+        String contextStr = null;
+        if (request.getContext() != null && !request.getContext().isEmpty()) {
+            try {
+                contextStr = objectMapper.writeValueAsString(request.getContext());
+            } catch (Exception e) {
+                log.warn("Failed to serialize context map", e);
+                contextStr = request.getContext().toString();
+            }
+        }
+        
+        LogEntry entry = logParser.parseLog(
                 request.getRawLog(),
                 request.getSource(),
                 request.getSeverity(),
-                request.getContext(),
+                contextStr,
                 request.getEnvironment()
         );
+        entry.setCreatedAt(Instant.now().atZone(java.time.ZoneId.systemDefault()).toLocalDateTime());
+        entry.setStatus(LogEntry.ProcessingStatus.PENDING);
+        LogEntry saved = logEntryRepository.save(entry);
+        log.info("Parsed and saved log entry with ID: {}", saved.getId());
+        return saved;
+    }
 
-        LogEntry savedEntry = logEntryRepository.save(logEntry);
-        log.info("Parsed and saved log entry with ID: {}", savedEntry.getId());
-        return savedEntry;
+    public UUID enqueueAnalysis(LogEntry entry, String correlationId) {
+        try {
+            AnalysisJob job = new AnalysisJob();
+            job.setLogEntryId(entry.getId());
+            job.setCorrelationId(correlationId);
+            job.setStatus(AnalysisJob.Status.PENDING);
+            job.setCreatedAt(Instant.now());
+            AnalysisJob saved = jobRepository.save(job);
+            
+            kafkaTemplate.send("analysis-jobs", saved.getId().toString(), objectMapper.writeValueAsString(saved));
+            log.info("Enqueued analysis job {} for log {}", saved.getId(), entry.getId());
+            return saved.getId();
+        } catch (Exception e) {
+            log.error("Failed to enqueue analysis job for log {}", entry.getId(), e);
+            throw new RuntimeException("Failed to enqueue analysis job", e);
+        }
     }
 
     @Transactional
     public AnalysisResult analyzeLog(LogEntry logEntry) {
         log.info("Starting analysis for log entry ID: {}", logEntry.getId());
         
-        // Check cache first
         String cacheKey = "analysis:" + logEntry.getId();
         try {
             Object cached = redisTemplate.opsForValue().get(cacheKey);
@@ -59,16 +97,13 @@ public class LogAnalysisService {
             log.warn("Failed to retrieve from Redis cache for key: {}", cacheKey, e);
         }
 
-        // Analyze with AI
         AnalysisResult result = aiAnalysisService.analyzeLog(logEntry);
         result = analysisResultRepository.save(result);
 
-        // Update log entry status
         logEntry.setStatus(LogEntry.ProcessingStatus.ANALYZED);
         logEntry.setAnalysisResult(result);
         logEntryRepository.save(logEntry);
 
-        // Cache result for 24 hours
         try {
             redisTemplate.opsForValue().set(cacheKey, result);
             redisTemplate.expire(cacheKey, Duration.ofHours(24));
@@ -109,24 +144,23 @@ public class LogAnalysisService {
                 .collect(Collectors.toList());
     }
 
-    public AnalysisResult getAnalysisResult(String logId) {
-        log.debug("Fetching analysis result for log ID: {}", logId);
-        LogEntry logEntry = logEntryRepository.findById(logId).orElse(null);
-        return logEntry != null ? logEntry.getAnalysisResult() : null;
-    }
-
     public List<AnalysisResult> findSimilarLogs(String logId) {
         log.debug("Finding similar logs for log ID: {}", logId);
-        LogEntry logEntry = logEntryRepository.findById(logId).orElse(null);
-        if (logEntry == null) {
-            log.warn("Log entry not found for ID: {}", logId);
+        try {
+            UUID id = UUID.fromString(logId);
+            LogEntry logEntry = logEntryRepository.findById(id).orElse(null);
+            if (logEntry == null) {
+                log.warn("Log entry not found for ID: {}", logId);
+                return List.of();
+            }
+
+            List<AnalysisResult> similar = analysisResultRepository
+                    .findSimilarAnalyses(logEntry.getErrorType(), logEntry.getSource(), 5);
+            log.info("Found {} similar logs for log ID: {}", similar.size(), logId);
+            return similar;
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid UUID format for logId: {}", logId);
             return List.of();
         }
-
-        // Find logs with same error type or source
-        List<AnalysisResult> similar = analysisResultRepository
-                .findSimilarAnalyses(logEntry.getErrorType(), logEntry.getSource(), 5);
-        log.info("Found {} similar logs for log ID: {}", similar.size(), logId);
-        return similar;
     }
 }

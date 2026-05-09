@@ -1,9 +1,12 @@
 package in.guardianservices.ai_log_analyzer.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
+
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -43,6 +46,8 @@ public class LogEntry {
 
     private String environment;
 
+    @ToString.Exclude
+    @JsonIgnore
     @OneToOne(mappedBy = "logEntry", cascade = CascadeType.ALL)
     private AnalysisResult analysisResult;
 

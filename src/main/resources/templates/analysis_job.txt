@@ -1,0 +1,13 @@
+CREATE TABLE analysis_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    log_entry_id UUID NOT NULL,
+
+    correlation_id VARCHAR(255),
+
+    status VARCHAR(50) NOT NULL,
+
+    fail_reason TEXT,
+
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

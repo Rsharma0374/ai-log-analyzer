@@ -1,51 +1,57 @@
 package in.guardianservices.ai_log_analyzer.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import in.guardianservices.ai_log_analyzer.service.InfisicalService;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.connection.RedisPassword;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.jedis.JedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.RedisSerializer;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.util.CollectionUtils;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 
-import java.util.Map;
-
-@Slf4j
 @Configuration
 public class RedisConfig {
 
-    private final InfisicalService infisicalService;
-
-
-
-
-    public RedisConfig(InfisicalService infisicalService) {
-        this.infisicalService = infisicalService;
-    }
+    @Autowired
+    private InfisicalService infisicalService;
 
     @Bean
-    public JedisConnectionFactory jedisConnectionFactory() throws Exception {
+    public JedisConnectionFactory jedisConnectionFactory() {
         String host = infisicalService.getSecret("host", "RedisSecret");
         String port = infisicalService.getSecret("port", "RedisSecret");
         String password = infisicalService.getSecret("password", "RedisSecret");
         RedisStandaloneConfiguration redisConfig = new RedisStandaloneConfiguration();
         redisConfig.setHostName(StringUtils.isBlank(host) ? "localhost" : host);
         redisConfig.setPort(StringUtils.isBlank(port) ? 6379 : Integer.parseInt(port));
-        redisConfig.setPassword(StringUtils.isBlank(password) ? null : password);
+        if (StringUtils.isNotBlank(password)) {
+            redisConfig.setPassword(password);
+        }
         return new JedisConnectionFactory(redisConfig);
     }
 
     @Bean
-    public RedisTemplate<String, Object> redisTemplate() throws Exception {
+    public RedisTemplate<String, Object> redisTemplate() {
         RedisTemplate<String, Object> redisTemplate = new RedisTemplate<>();
         redisTemplate.setConnectionFactory(jedisConnectionFactory());
-        redisTemplate.setKeySerializer(RedisSerializer.string());
-        redisTemplate.setValueSerializer(RedisSerializer.json());
+
+        ObjectMapper customMapper = new ObjectMapper();
+        // Required to serialize java.time.LocalDateTime correctly
+        customMapper.registerModule(new JavaTimeModule());
+        customMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+        GenericJackson2JsonRedisSerializer jsonSerializer = new GenericJackson2JsonRedisSerializer(customMapper);
+
+        redisTemplate.setKeySerializer(new StringRedisSerializer());
+        redisTemplate.setValueSerializer(jsonSerializer);
+        redisTemplate.setHashKeySerializer(new StringRedisSerializer());
+        redisTemplate.setHashValueSerializer(jsonSerializer);
+
+        redisTemplate.afterPropertiesSet();
         return redisTemplate;
     }
 }

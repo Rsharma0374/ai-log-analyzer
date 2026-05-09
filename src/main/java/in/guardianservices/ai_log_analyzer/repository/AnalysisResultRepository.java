@@ -5,9 +5,10 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 import java.util.List;
+import java.util.UUID;
 
 @Repository
-public interface AnalysisResultRepository extends JpaRepository<AnalysisResult, String> {
+public interface AnalysisResultRepository extends JpaRepository<AnalysisResult, UUID> {
 
     @Query("""
         SELECT ar FROM AnalysisResult ar
@@ -20,4 +21,7 @@ public interface AnalysisResultRepository extends JpaRepository<AnalysisResult, 
 
     @Query("SELECT ar FROM AnalysisResult ar WHERE ar.confidenceScore >= ?1 ORDER BY ar.analyzedAt DESC")
     List<AnalysisResult> findHighConfidenceAnalyses(Integer minConfidence);
+
+    @Query("SELECT ar FROM AnalysisResult ar WHERE ar.logEntry.id = ?1")
+    List<AnalysisResult> findByLogEntryId(UUID logEntryId);
 }

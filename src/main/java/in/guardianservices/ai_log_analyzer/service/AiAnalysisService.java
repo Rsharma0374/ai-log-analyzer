@@ -4,14 +4,23 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import in.guardianservices.ai_log_analyzer.model.AiProviderConfig;
 import in.guardianservices.ai_log_analyzer.model.AnalysisResult;
 import in.guardianservices.ai_log_analyzer.model.LogEntry;
+import in.guardianservices.ai_log_analyzer.repository.AnalysisResultRepository;
+import in.guardianservices.ai_log_analyzer.repository.LogEntryRepository;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.List;
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class AiAnalysisService {
 
     private final MerlinAICodeAnalyzer merlinAICodeAnalyzer;
@@ -19,59 +28,108 @@ public class AiAnalysisService {
     private final DeepseekService deepseekService;
     private final AiProviderResolverService aiProviderResolverService;
     private final ObjectMapper objectMapper;
+    private final AnalysisResultRepository analysisResultRepository;
+    private final LogEntryRepository logEntryRepository;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final AIResponseParser aiResponseParser; // parser to extract rca/fix/code/confidence
 
     @Autowired
     public AiAnalysisService(MerlinAICodeAnalyzer merlinAICodeAnalyzer,
                              GeminiService geminiService,
                              DeepseekService deepseekService,
-                             AiProviderResolverService aiProviderResolverService) {
+                             AiProviderResolverService aiProviderResolverService,
+                             AnalysisResultRepository analysisResultRepository,
+                             LogEntryRepository logEntryRepository,
+                             RedisTemplate<String, Object> redisTemplate,
+                             AIResponseParser aiResponseParser) {
         this.merlinAICodeAnalyzer = merlinAICodeAnalyzer;
         this.geminiService = geminiService;
         this.deepseekService = deepseekService;
         this.aiProviderResolverService = aiProviderResolverService;
+        this.analysisResultRepository = analysisResultRepository;
+        this.logEntryRepository = logEntryRepository;
+        this.redisTemplate = redisTemplate;
+        this.aiResponseParser = aiResponseParser;
         this.objectMapper = new ObjectMapper();
     }
 
     public AnalysisResult analyzeLog(LogEntry logEntry) {
+        log.info("Starting analysis for log entry ID: {}", logEntry.getId());
+        String cacheKey = "analysis:log:" + logEntry.getId();
+        
+        // 1. Check Redis Cache
         try {
-            long startTime = System.currentTimeMillis();
-            log.info("Starting AI analysis for log entry ID: {}", logEntry.getId());
-
-            String prompt = buildAnalysisPrompt(logEntry);
-            AiProviderConfig aiProviderConfig = aiProviderResolverService.getAiProvider();
-            
-            log.info("Using AI Provider: {}", aiProviderConfig.getConfigValue());
-
-            String aiResponse = switch (aiProviderConfig.getConfigValue().toUpperCase()) {
-                case "CLAUDE"   -> callClaudeAPI(prompt);
-                case "MERLIN"   -> merlinAICodeAnalyzer.analyzeCode(prompt);
-                case "DEEPSEEK" -> deepseekService.callDeepSeekAPI(prompt);
-                case "GEMINI"   -> geminiService.callGeminiAPI(prompt);
-                default -> {
-                    log.warn("Unknown AI provider '{}', falling back to DeepSeek", aiProviderConfig.getConfigValue());
-                    yield deepseekService.callDeepSeekAPI(prompt);
+            Object cached = redisTemplate.opsForValue().get(cacheKey);
+            if (cached != null) {
+                log.info("Cache hit for log: {}", logEntry.getId());
+                if (cached instanceof AnalysisResult) {
+                    return (AnalysisResult) cached;
                 }
-            };
-            
-            log.debug("Received AI response successfully");
-            String[] parsed = parseAIResponse(aiResponse);
-
-            AnalysisResult result = new AnalysisResult();
-            result.setLogEntry(logEntry);
-            result.setRootCauseAnalysis(parsed[0]);
-            result.setRecommendedFix(parsed[1]);
-            result.setCodeSnippet(parsed[2]);
-            result.setConfidenceScore(extractConfidenceScore(aiResponse));
-            result.setAiModel(aiProviderConfig.getModel());
-            result.setAnalyzedAt(LocalDateTime.now());
-            result.setAnalysisTimeMs(System.currentTimeMillis() - startTime);
-
-            log.info("AI analysis completed successfully for log entry ID: {}", logEntry.getId());
-            return result;
+                return objectMapper.convertValue(cached, AnalysisResult.class);
+            }
         } catch (Exception e) {
-            log.error("Failed to analyze log entry ID: {}", logEntry.getId(), e);
-            throw new RuntimeException("AI analysis failed", e);
+            log.warn("Failed to retrieve from Redis cache for key: {}", cacheKey, e);
         }
+
+        // 2. Idempotency Check: DB check to prevent duplicate key constraint violations
+        List<AnalysisResult> existingResults = analysisResultRepository.findByLogEntryId(logEntry.getId());
+        if (!existingResults.isEmpty()) {
+            log.info("Analysis already exists in database for log entry ID: {}", logEntry.getId());
+            AnalysisResult existing = existingResults.get(0);
+            
+            // Re-populate cache since it missed but DB hit
+            try {
+                redisTemplate.opsForValue().set(cacheKey, existing);
+                redisTemplate.expire(cacheKey, Duration.ofHours(24));
+            } catch (Exception e) {
+                // Ignore cache update failure
+            }
+            return existing;
+        }
+
+        // 3. Perform AI Analysis
+        String prompt = buildAnalysisPrompt(logEntry);
+        String aiResponse = deepseekService.callDeepSeekAPI(prompt); // may throw
+        String[] parsed = aiResponseParser.parseAIResponse(aiResponse); // returns {rca, fix, code}
+        
+        AnalysisResult result = new AnalysisResult();
+        result.setLogEntry(logEntry);
+        result.setRootCauseAnalysis(parsed[0]);
+        result.setRecommendedFix(parsed[1]);
+        result.setCodeSnippet(parsed[2]);
+        result.setConfidenceScore(aiResponseParser.extractConfidenceScore(aiResponse));
+        result.setAiModel("deepseek"); // set properly with info from DeepseekService if available
+        result.setAnalyzedAt(LocalDateTime.now());
+        
+        long startTimeMs = logEntry.getCreatedAt() != null ? 
+                           logEntry.getCreatedAt().atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli() : 
+                           System.currentTimeMillis();
+        result.setAnalysisTimeMs(System.currentTimeMillis() - startTimeMs);
+
+        // 4. Persist in a new transaction
+        AnalysisResult saved = persistAnalysisResult(result);
+        
+        // 5. Update log entry status
+        logEntry.setStatus(LogEntry.ProcessingStatus.ANALYZED);
+        logEntry.setAnalysisResult(saved);
+        logEntryRepository.save(logEntry);
+        
+        // 6. Update Cache
+        try {
+            redisTemplate.opsForValue().set(cacheKey, saved);
+            redisTemplate.expire(cacheKey, Duration.ofHours(24));
+            log.debug("Cached analysis result for log: {}", logEntry.getId());
+        } catch (Exception e) {
+            log.warn("Failed to save to Redis cache for key: {}", cacheKey, e);
+        }
+
+        log.info("Log analyzed successfully: {}", logEntry.getId());
+        return saved;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    protected AnalysisResult persistAnalysisResult(AnalysisResult result) {
+        return analysisResultRepository.save(result);
     }
 
     private String buildAnalysisPrompt(LogEntry logEntry) {
